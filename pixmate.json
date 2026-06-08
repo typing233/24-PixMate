@@ -1,0 +1,19 @@
+{
+  "general": {
+    "display": "auto",
+    "companion_width": 20,
+    "max_fps": 6,
+    "sprite_theme": "default"
+  },
+  "detection": {
+    "streaming_threshold": 50,
+    "idle_timeout": 5.0,
+    "sleep_timeout": 30.0,
+    "error_timeout": 5.0
+  },
+  "appearance": {
+    "color_mode": "auto",
+    "show_label": true,
+    "ascii_only": false
+  }
+}

@@ -1,0 +1,193 @@
+"""Event parser: detects Claude Code session events from terminal I/O stream."""
+
+import re
+import time
+from typing import Generator
+
+from .events import Event, EventType, Direction
+
+
+ANSI_ESCAPE = re.compile(
+    r"\x1b(?:\[[0-9;]*[A-Za-z]|\][^\x07]*(?:\x07|\x1b\\)|[()][AB012]|[78M]|.)"
+)
+
+SPINNER_CHARS = frozenset("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟⣯⣷")
+
+TOOL_PATTERNS = {
+    "Read": re.compile(r"(?:Read|Reading)\b"),
+    "Edit": re.compile(r"(?:Edit|Editing)\b"),
+    "Write": re.compile(r"(?:Write|Writing)\b"),
+    "Bash": re.compile(r"(?:Bash|Running)\b"),
+    "LSP": re.compile(r"LSP\b"),
+    "WebSearch": re.compile(r"WebSearch|WebFetch"),
+    "Agent": re.compile(r"Agent\b"),
+}
+
+BOX_CHARS = frozenset("─│┌┐└┘├┤┬┴┼╭╮╰╯")
+
+ERROR_PATTERNS = re.compile(
+    r"(?:Error|error|ERROR|FAILED|failed|panic|Traceback|Exception)", re.IGNORECASE
+)
+
+PERMISSION_PATTERN = re.compile(r"(?:Allow|Deny|allow|deny)\s")
+
+SUCCESS_PATTERNS = re.compile(r"[✓✔]|Done|Success|Completed")
+
+RESUME_PATTERN = re.compile(r"(?:Resuming|Resume|Reconnect)")
+
+
+class EventParser:
+    def __init__(
+        self,
+        streaming_threshold: float = 50.0,
+        idle_timeout: float = 5.0,
+    ):
+        self._streaming_threshold = streaming_threshold
+        self._idle_timeout = idle_timeout
+
+        self._last_output_time: float = 0.0
+        self._output_rate: float = 0.0
+        self._rate_alpha: float = 0.3
+        self._is_streaming: bool = False
+        self._is_thinking: bool = False
+        self._in_tool_block: bool = False
+        self._current_tool: str | None = None
+        self._last_event_time: float = time.monotonic()
+
+    def strip_ansi(self, text: str) -> str:
+        return ANSI_ESCAPE.sub("", text)
+
+    def feed(self, data: bytes, direction: Direction) -> list[Event]:
+        events = []
+        now = time.monotonic()
+
+        if direction == Direction.INPUT:
+            events.extend(self._parse_input(data, now))
+        else:
+            events.extend(self._parse_output(data, now))
+
+        if events:
+            self._last_event_time = now
+        return events
+
+    def check_idle(self) -> Event | None:
+        now = time.monotonic()
+        elapsed = now - self._last_event_time
+        if elapsed >= self._idle_timeout and self._is_streaming:
+            self._is_streaming = False
+            return Event(EventType.STREAM_END)
+        if elapsed >= self._idle_timeout:
+            self._last_event_time = now
+            return Event(EventType.IDLE)
+        return None
+
+    def _parse_input(self, data: bytes, now: float) -> list[Event]:
+        events = []
+        if b"\x03" in data:
+            events.append(Event(EventType.CANCEL))
+            self._is_streaming = False
+            self._is_thinking = False
+            self._in_tool_block = False
+        elif data.strip():
+            events.append(Event(EventType.USER_INPUT, data={"raw": data[:50]}))
+        return events
+
+    def _parse_output(self, data: bytes, now: float) -> list[Event]:
+        events = []
+
+        try:
+            text = data.decode("utf-8", errors="replace")
+        except Exception:
+            return events
+
+        stripped = self.strip_ansi(text)
+
+        # Update output rate
+        dt = now - self._last_output_time if self._last_output_time else 0.1
+        if dt > 0:
+            instant_rate = len(stripped) / dt
+            self._output_rate = (
+                self._rate_alpha * instant_rate + (1 - self._rate_alpha) * self._output_rate
+            )
+        self._last_output_time = now
+
+        # Spinner detection (thinking)
+        if self._detect_spinner(stripped):
+            if not self._is_thinking:
+                self._is_thinking = True
+                self._is_streaming = False
+                events.append(Event(EventType.THINKING_START))
+            return events
+
+        if self._is_thinking and len(stripped) > 3:
+            self._is_thinking = False
+            events.append(Event(EventType.THINKING_END))
+
+        # Tool block detection
+        tool = self._detect_tool(stripped)
+        if tool:
+            if self._in_tool_block and self._current_tool != tool:
+                events.append(Event(EventType.TOOL_END, data={"tool": self._current_tool}))
+            self._in_tool_block = True
+            self._current_tool = tool
+            self._is_streaming = False
+            events.append(Event(EventType.TOOL_START, data={"tool": tool}))
+            return events
+
+        # Error detection
+        if ERROR_PATTERNS.search(stripped):
+            if self._in_tool_block:
+                self._in_tool_block = False
+                events.append(Event(EventType.TOOL_END, data={"tool": self._current_tool}))
+            events.append(Event(EventType.ERROR, data={"text": stripped[:100]}))
+            self._is_streaming = False
+            return events
+
+        # Success detection
+        if SUCCESS_PATTERNS.search(stripped):
+            if self._in_tool_block:
+                self._in_tool_block = False
+                events.append(Event(EventType.TOOL_END, data={"tool": self._current_tool}))
+            events.append(Event(EventType.SUCCESS))
+            self._is_streaming = False
+            return events
+
+        # Permission prompt
+        if PERMISSION_PATTERN.search(stripped):
+            events.append(Event(EventType.PERMISSION_PROMPT))
+            return events
+
+        # Session resume
+        if RESUME_PATTERN.search(stripped):
+            events.append(Event(EventType.SESSION_RESUME))
+            return events
+
+        # Streaming detection
+        if self._output_rate > self._streaming_threshold and len(stripped) > 5:
+            if not self._is_streaming:
+                self._is_streaming = True
+                events.append(Event(EventType.STREAM_START))
+        elif self._is_streaming and self._output_rate < self._streaming_threshold * 0.3:
+            self._is_streaming = False
+            events.append(Event(EventType.STREAM_END))
+
+        return events
+
+    def _detect_spinner(self, text: str) -> bool:
+        stripped = text.strip()
+        if not stripped:
+            return False
+        if len(stripped) <= 3 and any(c in SPINNER_CHARS for c in stripped):
+            return True
+        if "Thinking" in text or "thinking" in text:
+            return True
+        return False
+
+    def _detect_tool(self, text: str) -> str | None:
+        has_box = any(c in text for c in BOX_CHARS)
+        if not has_box:
+            return None
+        for tool_name, pattern in TOOL_PATTERNS.items():
+            if pattern.search(text):
+                return tool_name
+        return None
