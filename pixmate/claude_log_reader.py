@@ -1,16 +1,25 @@
 """Claude Code log stream reader.
 
-Parses Claude Code's real session logs (JSONL) to emit structured events.
+Parses Claude Code's real session JSONL transcripts to emit structured events.
 Claude Code writes conversation transcripts to:
-  ~/.claude/projects/<project-hash>/logs/<session-id>.jsonl
+  ~/.claude/projects/<project-hash>/<session-id>.jsonl
 
-Each line is a JSON object representing a message turn with role, content,
-tool_use blocks, etc. This module tails the active log file and maps entries
-to PixMate events — giving richer signal than PTY heuristics alone.
+Entry types observed in real transcripts:
+  - type="user": user input or tool_result feedback
+    message.content: str (user text) | list[{type: "tool_result", ...}]
+  - type="assistant": model response
+    message.content: list[{type: "thinking"|"text"|"tool_use", ...}]
+  - type="system": system events (api_error → retry, turn_duration, informational)
+    subtype, level, error fields
+  - type="permission-mode": permission mode changes
+  - type="file-history-snapshot": file state snapshots
+  - type="ai-title": session title
+  - type="last-prompt": prompt tracking
+  - type="attachment": context attachments
+  - type="queue-operation": task queue operations
 """
 
 import asyncio
-import glob
 import json
 import os
 import time
@@ -21,158 +30,218 @@ from .events import Event, EventType, EventSource
 
 
 def find_claude_log_dir() -> Path | None:
-    """Find the most recently active Claude Code log directory."""
+    """Find the Claude Code projects base directory."""
     base = Path.home() / ".claude" / "projects"
     if not base.exists():
         return None
-
-    # Find subdirs, pick the one with the most recent log file
-    best_dir = None
-    best_mtime = 0.0
-
-    for project_dir in base.iterdir():
-        if not project_dir.is_dir():
-            continue
-        # Claude Code stores conversation in the project dir directly
-        # or under a sessions/ subdirectory depending on version
-        for candidate in [project_dir, project_dir / "sessions"]:
-            if not candidate.exists():
-                continue
-            for f in candidate.glob("*.jsonl"):
-                mt = f.stat().st_mtime
-                if mt > best_mtime:
-                    best_mtime = mt
-                    best_dir = candidate
-
-    return best_dir
+    return base
 
 
 def find_latest_log(log_dir: Path | None = None) -> Path | None:
-    """Find the most recent .jsonl log file in the given or auto-detected dir."""
+    """Find the most recently modified .jsonl transcript across all projects."""
     if log_dir is None:
         log_dir = find_claude_log_dir()
     if log_dir is None or not log_dir.exists():
         return None
 
-    candidates = sorted(log_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
-    return candidates[0] if candidates else None
+    best_path = None
+    best_mtime = 0.0
+
+    for project_dir in log_dir.iterdir():
+        if not project_dir.is_dir():
+            continue
+        for f in project_dir.glob("*.jsonl"):
+            try:
+                mt = f.stat().st_mtime
+                if mt > best_mtime:
+                    best_mtime = mt
+                    best_path = f
+            except OSError:
+                continue
+
+    return best_path
 
 
 def parse_log_entry(entry: dict) -> list[Event]:
-    """Parse a single Claude Code log entry into PixMate events."""
+    """Parse a single Claude Code JSONL entry into PixMate events.
+
+    Handles the real Claude Code transcript format:
+    - type="user" with message.content as str → user input
+    - type="user" with message.content as list[tool_result] → tool results
+    - type="assistant" with content blocks → thinking/text/tool_use
+    - type="system" with subtype="api_error" → retry/error
+    """
     events = []
+    entry_type = entry.get("type", "")
 
-    msg_type = entry.get("type", "")
-    role = entry.get("role", "")
-    content = entry.get("content", "")
-
-    # Handle different log entry formats
-    if msg_type == "human" or role == "human" or role == "user":
-        events.append(Event(
-            EventType.USER_INPUT,
-            source=EventSource.CLAUDE_LOG,
-            data={"text": _extract_text(content)[:80]},
-        ))
-
-    elif msg_type == "assistant" or role == "assistant":
-        # Check for tool use in content blocks
-        if isinstance(content, list):
-            for block in content:
-                if isinstance(block, dict):
-                    block_type = block.get("type", "")
-                    if block_type == "tool_use":
-                        tool_name = block.get("name", "unknown")
-                        events.append(Event(
-                            EventType.TOOL_START,
-                            source=EventSource.CLAUDE_LOG,
-                            data={"tool": tool_name},
-                        ))
-                    elif block_type == "thinking":
-                        events.append(Event(
-                            EventType.THINKING_START,
-                            source=EventSource.CLAUDE_LOG,
-                        ))
-                    elif block_type == "text":
-                        text = block.get("text", "")
-                        if text and not events:
-                            events.append(Event(
-                                EventType.STREAM_START,
-                                source=EventSource.CLAUDE_LOG,
-                                data={"text": text[:60]},
-                            ))
-        elif isinstance(content, str) and content:
-            events.append(Event(
-                EventType.STREAM_START,
-                source=EventSource.CLAUDE_LOG,
-                data={"text": content[:60]},
-            ))
-
-    elif msg_type == "tool_result" or role == "tool":
-        is_error = entry.get("is_error", False)
-        if is_error:
-            events.append(Event(
-                EventType.ERROR,
-                source=EventSource.CLAUDE_LOG,
-                data={"text": _extract_text(content)[:100]},
-            ))
-        else:
-            events.append(Event(
-                EventType.TOOL_END,
-                source=EventSource.CLAUDE_LOG,
-                data={"tool": entry.get("name", "")},
-            ))
-
-    elif msg_type == "permission_request":
-        events.append(Event(
-            EventType.PERMISSION_PROMPT,
-            source=EventSource.CLAUDE_LOG,
-            data={"tool": entry.get("tool", "")},
-        ))
-
-    elif msg_type == "permission_response":
-        accepted = entry.get("accepted", entry.get("allowed", False))
-        events.append(Event(
-            EventType.PERMISSION_RESPONSE,
-            source=EventSource.CLAUDE_LOG,
-            data={"accepted": accepted},
-        ))
-
-    elif msg_type == "retry" or "retry" in str(entry.get("error", "")):
-        events.append(Event(
-            EventType.RETRY,
-            source=EventSource.CLAUDE_LOG,
-            data={"reason": entry.get("error", "")},
-        ))
-
-    elif msg_type == "resume" or msg_type == "session_start":
+    if entry_type == "user":
+        events.extend(_parse_user_entry(entry))
+    elif entry_type == "assistant":
+        events.extend(_parse_assistant_entry(entry))
+    elif entry_type == "system":
+        events.extend(_parse_system_entry(entry))
+    elif entry_type == "permission-mode":
         events.append(Event(
             EventType.SESSION_RESUME,
             source=EventSource.CLAUDE_LOG,
+            data={"mode": entry.get("permissionMode", "")},
         ))
 
     return events
 
 
-def _extract_text(content) -> str:
-    """Extract plain text from various content formats."""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = []
+def _parse_user_entry(entry: dict) -> list[Event]:
+    """Parse a user-type entry (user input or tool results)."""
+    events = []
+    msg = entry.get("message", {})
+    content = msg.get("content", "")
+
+    if isinstance(content, str) and content.strip():
+        # Direct user text input
+        events.append(Event(
+            EventType.USER_INPUT,
+            source=EventSource.CLAUDE_LOG,
+            data={"text": content.strip()[:100]},
+        ))
+    elif isinstance(content, list):
+        # Tool results come back as user messages with tool_result blocks
         for block in content:
-            if isinstance(block, dict):
-                parts.append(block.get("text", ""))
-            elif isinstance(block, str):
-                parts.append(block)
-        return " ".join(parts)
-    return str(content)
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get("type", "")
+
+            if block_type == "tool_result":
+                tool_use_id = block.get("tool_use_id", "")
+                is_error = block.get("is_error", False)
+                result_content = block.get("content", "")
+
+                if isinstance(result_content, list):
+                    # content can be a list of {type: "text", text: "..."}
+                    texts = []
+                    for rb in result_content:
+                        if isinstance(rb, dict) and rb.get("type") == "text":
+                            texts.append(rb.get("text", ""))
+                    result_text = "\n".join(texts)
+                elif isinstance(result_content, str):
+                    result_text = result_content
+                else:
+                    result_text = str(result_content)
+
+                if is_error:
+                    events.append(Event(
+                        EventType.ERROR,
+                        source=EventSource.CLAUDE_LOG,
+                        data={
+                            "tool_use_id": tool_use_id,
+                            "text": result_text[:150],
+                        },
+                    ))
+                else:
+                    events.append(Event(
+                        EventType.TOOL_END,
+                        source=EventSource.CLAUDE_LOG,
+                        data={
+                            "tool_use_id": tool_use_id,
+                            "text": result_text[:80],
+                        },
+                    ))
+
+    return events
+
+
+def _parse_assistant_entry(entry: dict) -> list[Event]:
+    """Parse an assistant-type entry (thinking, text, tool_use)."""
+    events = []
+    msg = entry.get("message", {})
+    content = msg.get("content", [])
+
+    if not isinstance(content, list):
+        if isinstance(content, str) and content.strip():
+            events.append(Event(
+                EventType.STREAM_START,
+                source=EventSource.CLAUDE_LOG,
+                data={"text": content[:80]},
+            ))
+        return events
+
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        block_type = block.get("type", "")
+
+        if block_type == "thinking":
+            events.append(Event(
+                EventType.THINKING_START,
+                source=EventSource.CLAUDE_LOG,
+                data={"length": len(block.get("text", ""))},
+            ))
+
+        elif block_type == "text":
+            text = block.get("text", "")
+            if text.strip():
+                events.append(Event(
+                    EventType.STREAM_START,
+                    source=EventSource.CLAUDE_LOG,
+                    data={"text": text[:80]},
+                ))
+
+        elif block_type == "tool_use":
+            tool_name = block.get("name", "unknown")
+            tool_id = block.get("id", "")
+            tool_input = block.get("input", {})
+
+            # Extract useful context from input
+            context = ""
+            if isinstance(tool_input, dict):
+                if "command" in tool_input:
+                    context = tool_input["command"][:60]
+                elif "file_path" in tool_input:
+                    context = tool_input["file_path"]
+                elif "query" in tool_input:
+                    context = tool_input["query"][:60]
+
+            events.append(Event(
+                EventType.TOOL_START,
+                source=EventSource.CLAUDE_LOG,
+                data={
+                    "tool": tool_name,
+                    "id": tool_id,
+                    "context": context,
+                },
+            ))
+
+    return events
+
+
+def _parse_system_entry(entry: dict) -> list[Event]:
+    """Parse system entries (api_error → retry, etc.)."""
+    events = []
+    subtype = entry.get("subtype", "")
+    level = entry.get("level", "")
+
+    if subtype == "api_error":
+        error = entry.get("error", {})
+        status = error.get("status", 0) if isinstance(error, dict) else 0
+        events.append(Event(
+            EventType.RETRY,
+            source=EventSource.CLAUDE_LOG,
+            data={"subtype": subtype, "status": status},
+        ))
+    elif level == "error":
+        events.append(Event(
+            EventType.ERROR,
+            source=EventSource.CLAUDE_LOG,
+            data={"subtype": subtype},
+        ))
+
+    return events
 
 
 class ClaudeLogWatcher:
-    """Tails the active Claude Code log file and emits parsed events."""
+    """Tails the active Claude Code JSONL transcript and emits parsed events."""
 
-    def __init__(self, log_path: Path | None = None):
-        self._log_path = log_path
+    def __init__(self, log_path: Path | str | None = None):
+        self._log_path: Path | None = Path(log_path) if log_path else None
         self._position: int = 0
         self._running: bool = False
         self._last_check_path_time: float = 0.0

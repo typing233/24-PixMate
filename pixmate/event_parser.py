@@ -155,7 +155,7 @@ class EventParser:
             )
         self._last_output_time = now
 
-        # Spinner detection (thinking)
+        # Spinner detection (thinking) — only when entire chunk is a spinner
         if self._detect_spinner(stripped):
             if not self._is_thinking:
                 self._is_thinking = True
@@ -167,22 +167,47 @@ class EventParser:
             self._is_thinking = False
             events.append(Event(EventType.THINKING_END))
 
-        # Retry detection (before tool/error so it takes priority)
-        if RETRY_PATTERN.search(stripped):
+        # Process line-by-line so events in the same chunk are all detected
+        lines = stripped.split("\n")
+        for line in lines:
+            line_stripped = line.strip()
+            if not line_stripped:
+                continue
+            line_events = self._parse_single_line(line_stripped)
+            events.extend(line_events)
+
+        # If no line-level events matched, check for streaming
+        if not events or (len(events) == 1 and events[0].type == EventType.THINKING_END):
+            if self._output_rate > self._streaming_threshold and len(stripped) > 5:
+                if not self._is_streaming:
+                    self._is_streaming = True
+                    events.append(Event(EventType.STREAM_START))
+            elif self._is_streaming and self._output_rate < self._streaming_threshold * 0.3:
+                self._is_streaming = False
+                events.append(Event(EventType.STREAM_END))
+
+        return events
+
+    def _parse_single_line(self, line: str) -> list[Event]:
+        """Parse a single stripped line for events. Returns list (may be empty)."""
+        events = []
+
+        # Retry detection
+        if RETRY_PATTERN.search(line):
             self._is_streaming = False
             if self._in_tool_block:
                 self._in_tool_block = False
                 events.append(Event(EventType.TOOL_END, data={"tool": self._current_tool}))
-            events.append(Event(EventType.RETRY, data={"text": stripped[:80]}))
+            events.append(Event(EventType.RETRY, data={"text": line[:80]}))
             return events
 
-        # Concurrent task detection
-        if CONCURRENT_TASK_PATTERN.search(stripped) and BOX_CHARS & set(stripped):
-            events.append(Event(EventType.CONCURRENT_TASK, data={"text": stripped[:80]}))
+        # Concurrent task detection (box chars + concurrent keyword)
+        if CONCURRENT_TASK_PATTERN.search(line) and BOX_CHARS & set(line):
+            events.append(Event(EventType.CONCURRENT_TASK, data={"text": line[:80]}))
             return events
 
         # Tool block detection
-        tool = self._detect_tool(stripped)
+        tool = self._detect_tool(line)
         if tool:
             if self._in_tool_block and self._current_tool != tool:
                 events.append(Event(EventType.TOOL_END, data={"tool": self._current_tool}))
@@ -190,19 +215,34 @@ class EventParser:
             self._current_tool = tool
             self._is_streaming = False
             events.append(Event(EventType.TOOL_START, data={"tool": tool}))
+            # Don't return — also check permission on the same line (rare but possible)
+            if not PERMISSION_PATTERN.search(line):
+                return events
+
+        # Permission prompt (can co-occur with tool box in same chunk)
+        if PERMISSION_PATTERN.search(line):
+            self._awaiting_permission = True
+            events.append(Event(EventType.PERMISSION_PROMPT))
+            return events
+
+        # Permission response in output (system-side confirmation)
+        if PERMISSION_RESPONSE_PATTERN.search(line):
+            if self._awaiting_permission:
+                self._awaiting_permission = False
+            events.append(Event(EventType.PERMISSION_RESPONSE, data={"accepted": True}))
             return events
 
         # Error detection
-        if ERROR_PATTERNS.search(stripped):
+        if ERROR_PATTERNS.search(line):
             if self._in_tool_block:
                 self._in_tool_block = False
                 events.append(Event(EventType.TOOL_END, data={"tool": self._current_tool}))
-            events.append(Event(EventType.ERROR, data={"text": stripped[:100]}))
+            events.append(Event(EventType.ERROR, data={"text": line[:100]}))
             self._is_streaming = False
             return events
 
         # Success detection
-        if SUCCESS_PATTERNS.search(stripped):
+        if SUCCESS_PATTERNS.search(line):
             if self._in_tool_block:
                 self._in_tool_block = False
                 events.append(Event(EventType.TOOL_END, data={"tool": self._current_tool}))
@@ -210,32 +250,10 @@ class EventParser:
             self._is_streaming = False
             return events
 
-        # Permission prompt
-        if PERMISSION_PATTERN.search(stripped):
-            self._awaiting_permission = True
-            events.append(Event(EventType.PERMISSION_PROMPT))
-            return events
-
-        # Permission response in output (system-side confirmation)
-        if PERMISSION_RESPONSE_PATTERN.search(stripped):
-            if self._awaiting_permission:
-                self._awaiting_permission = False
-            events.append(Event(EventType.PERMISSION_RESPONSE, data={"accepted": True}))
-            return events
-
         # Session resume
-        if RESUME_PATTERN.search(stripped):
+        if RESUME_PATTERN.search(line):
             events.append(Event(EventType.SESSION_RESUME))
             return events
-
-        # Streaming detection
-        if self._output_rate > self._streaming_threshold and len(stripped) > 5:
-            if not self._is_streaming:
-                self._is_streaming = True
-                events.append(Event(EventType.STREAM_START))
-        elif self._is_streaming and self._output_rate < self._streaming_threshold * 0.3:
-            self._is_streaming = False
-            events.append(Event(EventType.STREAM_END))
 
         return events
 

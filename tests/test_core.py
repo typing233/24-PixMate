@@ -305,23 +305,34 @@ def test_terminal_detect():
 
 
 def test_claude_log_parser_tool_use():
+    """Real format: assistant with message.content containing tool_use blocks."""
     entry = {
         "type": "assistant",
-        "role": "assistant",
-        "content": [
-            {"type": "thinking", "text": "Let me think..."},
-            {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}},
-        ],
+        "message": {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "text": "Let me think..."},
+                {"type": "tool_use", "name": "Bash", "id": "toolu_1", "input": {"command": "ls"}},
+            ],
+        },
     }
     events = parse_log_entry(entry)
     assert any(e.type == EventType.THINKING_START for e in events)
     assert any(e.type == EventType.TOOL_START and e.data.get("tool") == "Bash" for e in events)
     assert all(e.source == EventSource.CLAUDE_LOG for e in events)
+    # Check command context extracted from input
+    tool_ev = [e for e in events if e.type == EventType.TOOL_START][0]
+    assert tool_ev.data["context"] == "ls"
     print("  [PASS] test_claude_log_parser_tool_use")
 
 
 def test_claude_log_parser_user_message():
-    entry = {"type": "human", "role": "user", "content": "Fix the bug"}
+    """Real format: type=user with message.content as plain string."""
+    entry = {
+        "type": "user",
+        "message": {"role": "user", "content": "Fix the bug"},
+        "uuid": "abc",
+    }
     events = parse_log_entry(entry)
     assert any(e.type == EventType.USER_INPUT for e in events)
     assert events[0].data["text"] == "Fix the bug"
@@ -329,35 +340,232 @@ def test_claude_log_parser_user_message():
 
 
 def test_claude_log_parser_tool_result_error():
+    """Real format: user message with tool_result block, is_error=True."""
     entry = {
-        "type": "tool_result",
-        "role": "tool",
-        "name": "Bash",
-        "is_error": True,
-        "content": "command not found",
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_xyz",
+                    "is_error": True,
+                    "content": "command not found",
+                }
+            ],
+        },
     }
     events = parse_log_entry(entry)
     assert any(e.type == EventType.ERROR for e in events)
+    assert "command not found" in events[0].data["text"]
     print("  [PASS] test_claude_log_parser_tool_result_error")
 
 
 def test_claude_log_parser_permission():
-    entry = {"type": "permission_request", "tool": "Bash"}
+    """permission-mode entry triggers session_resume (mode change signal)."""
+    entry = {"type": "permission-mode", "permissionMode": "default", "sessionId": "abc"}
     events = parse_log_entry(entry)
-    assert any(e.type == EventType.PERMISSION_PROMPT for e in events)
-
-    entry = {"type": "permission_response", "accepted": True}
-    events = parse_log_entry(entry)
-    assert any(e.type == EventType.PERMISSION_RESPONSE for e in events)
-    assert events[0].data["accepted"] is True
+    assert len(events) == 1
+    assert events[0].type == EventType.SESSION_RESUME
+    assert events[0].data["mode"] == "default"
     print("  [PASS] test_claude_log_parser_permission")
 
 
 def test_claude_log_parser_retry():
-    entry = {"type": "retry", "error": "rate_limit"}
+    """Real format: system entry with subtype=api_error is a retry signal."""
+    entry = {
+        "type": "system",
+        "subtype": "api_error",
+        "level": "error",
+        "error": {"status": 529, "headers": {}},
+    }
     events = parse_log_entry(entry)
     assert any(e.type == EventType.RETRY for e in events)
+    assert events[0].data["status"] == 529
     print("  [PASS] test_claude_log_parser_retry")
+
+
+def test_claude_log_real_format_user_text():
+    """Real Claude Code format: type=user with message.content as string."""
+    entry = {
+        "parentUuid": None,
+        "isSidechain": False,
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": "Fix the authentication bug in login.py"
+        },
+        "uuid": "abc-123",
+        "timestamp": "2026-06-08T07:03:58.725Z",
+    }
+    events = parse_log_entry(entry)
+    assert len(events) == 1
+    assert events[0].type == EventType.USER_INPUT
+    assert "authentication" in events[0].data["text"]
+    print("  [PASS] test_claude_log_real_format_user_text")
+
+
+def test_claude_log_real_format_assistant_thinking_and_tool():
+    """Real format: assistant with thinking + tool_use blocks."""
+    entry = {
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "model": "anonymous/orange9",
+            "content": [
+                {"type": "thinking", "text": "Let me analyze this bug..."},
+                {"type": "text", "text": "I'll fix the login flow."},
+                {"type": "tool_use", "name": "Edit", "id": "toolu_123",
+                 "input": {"file_path": "/app/login.py", "old_string": "x", "new_string": "y"}},
+            ],
+        },
+        "uuid": "def-456",
+    }
+    events = parse_log_entry(entry)
+    types = [e.type for e in events]
+    assert EventType.THINKING_START in types
+    assert EventType.STREAM_START in types
+    assert EventType.TOOL_START in types
+    tool_ev = [e for e in events if e.type == EventType.TOOL_START][0]
+    assert tool_ev.data["tool"] == "Edit"
+    assert tool_ev.data["context"] == "/app/login.py"
+    print("  [PASS] test_claude_log_real_format_assistant_thinking_and_tool")
+
+
+def test_claude_log_real_format_tool_result():
+    """Real format: user message containing tool_result blocks."""
+    entry = {
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_bdrk_013ABrWVP",
+                    "is_error": False,
+                    "content": "(Bash completed with no output)",
+                }
+            ],
+        },
+        "uuid": "ghi-789",
+    }
+    events = parse_log_entry(entry)
+    assert len(events) == 1
+    assert events[0].type == EventType.TOOL_END
+    assert "Bash completed" in events[0].data["text"]
+    print("  [PASS] test_claude_log_real_format_tool_result")
+
+
+def test_claude_log_real_format_tool_result_error():
+    """Real format: tool_result with is_error=True."""
+    entry = {
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_xyz",
+                    "is_error": True,
+                    "content": "Exit code 1\nTraceback (most recent call last):\n  File...",
+                }
+            ],
+        },
+    }
+    events = parse_log_entry(entry)
+    assert len(events) == 1
+    assert events[0].type == EventType.ERROR
+    assert "Traceback" in events[0].data["text"]
+    print("  [PASS] test_claude_log_real_format_tool_result_error")
+
+
+def test_claude_log_real_format_system_api_error():
+    """Real format: system entry with subtype=api_error → retry."""
+    entry = {
+        "type": "system",
+        "subtype": "api_error",
+        "level": "error",
+        "error": {"status": 500, "headers": {}},
+    }
+    events = parse_log_entry(entry)
+    assert len(events) == 1
+    assert events[0].type == EventType.RETRY
+    assert events[0].data["status"] == 500
+    print("  [PASS] test_claude_log_real_format_system_api_error")
+
+
+def test_claude_log_real_format_multiple_tool_results():
+    """Real format: multiple tool_result blocks in one message."""
+    entry = {
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "is_error": False,
+                 "content": "file read ok"},
+                {"type": "tool_result", "tool_use_id": "t2", "is_error": True,
+                 "content": "permission denied"},
+            ],
+        },
+    }
+    events = parse_log_entry(entry)
+    assert len(events) == 2
+    assert events[0].type == EventType.TOOL_END
+    assert events[1].type == EventType.ERROR
+    print("  [PASS] test_claude_log_real_format_multiple_tool_results")
+
+
+def test_parser_tool_and_permission_same_chunk():
+    """When tool box header and Allow?[Y/n] arrive in same data chunk,
+    both tool_start AND permission_prompt should fire."""
+    parser = EventParser()
+
+    # Simulate a single PTY read that contains both
+    chunk = "╭─ Bash ─────────────────╮\nAllow this command? [Y/n]".encode()
+    events = parser.feed(chunk, Direction.OUTPUT)
+
+    types = [e.type for e in events]
+    assert EventType.TOOL_START in types, f"Missing TOOL_START in {types}"
+    assert EventType.PERMISSION_PROMPT in types, f"Missing PERMISSION_PROMPT in {types}"
+    assert parser._awaiting_permission is True
+    print("  [PASS] test_parser_tool_and_permission_same_chunk")
+
+
+def test_parser_permission_then_user_input_triggers_response():
+    """After permission_prompt, user typing 'y' should trigger permission_response,
+    NOT a generic user_input event."""
+    parser = EventParser()
+
+    # First: output with permission prompt
+    parser.feed("Allow execution? [Y/n]".encode(), Direction.OUTPUT)
+    assert parser._awaiting_permission is True
+
+    # User types 'y' — should be permission_response
+    events = parser.feed(b"y", Direction.INPUT)
+    types = [e.type for e in events]
+    assert EventType.PERMISSION_RESPONSE in types, f"Expected PERMISSION_RESPONSE, got {types}"
+    assert EventType.USER_INPUT not in types, f"Should NOT emit USER_INPUT after permission"
+    resp = [e for e in events if e.type == EventType.PERMISSION_RESPONSE][0]
+    assert resp.data["accepted"] is True
+    assert parser._awaiting_permission is False
+
+    # After permission answered, next input is regular user_input
+    events2 = parser.feed(b"hello", Direction.INPUT)
+    types2 = [e.type for e in events2]
+    assert EventType.USER_INPUT in types2
+    print("  [PASS] test_parser_permission_then_user_input_triggers_response")
+
+
+def test_parser_permission_denied_response():
+    """User typing 'n' after permission prompt → accepted=False."""
+    parser = EventParser()
+    parser.feed("Deny this? [Y/n]".encode(), Direction.OUTPUT)
+
+    events = parser.feed(b"n", Direction.INPUT)
+    resp = [e for e in events if e.type == EventType.PERMISSION_RESPONSE]
+    assert len(resp) == 1
+    assert resp[0].data["accepted"] is False
+    print("  [PASS] test_parser_permission_denied_response")
 
 
 def test_event_source_field():
@@ -400,6 +608,15 @@ def run_all_tests():
         test_claude_log_parser_tool_result_error,
         test_claude_log_parser_permission,
         test_claude_log_parser_retry,
+        test_claude_log_real_format_user_text,
+        test_claude_log_real_format_assistant_thinking_and_tool,
+        test_claude_log_real_format_tool_result,
+        test_claude_log_real_format_tool_result_error,
+        test_claude_log_real_format_system_api_error,
+        test_claude_log_real_format_multiple_tool_results,
+        test_parser_tool_and_permission_same_chunk,
+        test_parser_permission_then_user_input_triggers_response,
+        test_parser_permission_denied_response,
         test_event_source_field,
     ]
 
