@@ -47,6 +47,9 @@ DEFAULT_TRANSITIONS: list[Transition] = [
     Transition(EventType.CANCEL, "*", "idle", priority=20),
     Transition(EventType.IDLE, "*", "idle", priority=1),
     Transition(EventType.PERMISSION_PROMPT, "*", "listening", priority=8),
+    Transition(EventType.PERMISSION_RESPONSE, "listening", "working", priority=9),
+    Transition(EventType.RETRY, "*", "thinking", priority=12),
+    Transition(EventType.CONCURRENT_TASK, "*", "working", priority=8),
     Transition(EventType.SESSION_RESUME, "*", "idle", priority=5),
 ]
 

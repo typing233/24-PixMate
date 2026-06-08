@@ -4,7 +4,7 @@ import re
 import time
 from typing import Generator
 
-from .events import Event, EventType, Direction
+from .events import Event, EventType, EventSource, Direction
 
 
 ANSI_ESCAPE = re.compile(
@@ -21,6 +21,8 @@ TOOL_PATTERNS = {
     "LSP": re.compile(r"LSP\b"),
     "WebSearch": re.compile(r"WebSearch|WebFetch"),
     "Agent": re.compile(r"Agent\b"),
+    "TaskCreate": re.compile(r"TaskCreate\b"),
+    "Monitor": re.compile(r"Monitor\b"),
 }
 
 BOX_CHARS = frozenset("─│┌┐└┘├┤┬┴┼╭╮╰╯")
@@ -29,11 +31,26 @@ ERROR_PATTERNS = re.compile(
     r"(?:Error|error|ERROR|FAILED|failed|panic|Traceback|Exception)", re.IGNORECASE
 )
 
-PERMISSION_PATTERN = re.compile(r"(?:Allow|Deny|allow|deny)\s")
+PERMISSION_PATTERN = re.compile(
+    r"(?:Allow|Deny|allow|deny)\s.*\?|(?:\[Y/n\]|\[y/N\])"
+)
 
-SUCCESS_PATTERNS = re.compile(r"[✓✔]|Done|Success|Completed")
+PERMISSION_RESPONSE_PATTERN = re.compile(
+    r"(?:Allowed|Denied|allowed|denied|Permission granted|approved)\b"
+)
+
+SUCCESS_PATTERNS = re.compile(r"[✓✔]|(?:^|\s)Done(?:\s|$)|Success|Completed")
 
 RESUME_PATTERN = re.compile(r"(?:Resuming|Resume|Reconnect)")
+
+RETRY_PATTERN = re.compile(
+    r"(?:Retrying|Retry|retrying|retry|Reattempt|reattempt|trying again|attempt \d+)"
+)
+
+CONCURRENT_TASK_PATTERN = re.compile(
+    r"(?:background|Background|run_in_background|parallel|concurrent|task[-_ ]?\d+)",
+    re.IGNORECASE,
+)
 
 
 class EventParser:
@@ -53,6 +70,8 @@ class EventParser:
         self._in_tool_block: bool = False
         self._current_tool: str | None = None
         self._last_event_time: float = time.monotonic()
+        self._last_data_time: float = time.monotonic()
+        self._awaiting_permission: bool = False
 
     def strip_ansi(self, text: str) -> str:
         return ANSI_ESCAPE.sub("", text)
@@ -60,6 +79,7 @@ class EventParser:
     def feed(self, data: bytes, direction: Direction) -> list[Event]:
         events = []
         now = time.monotonic()
+        self._last_data_time = now
 
         if direction == Direction.INPUT:
             events.extend(self._parse_input(data, now))
@@ -70,16 +90,30 @@ class EventParser:
             self._last_event_time = now
         return events
 
-    def check_idle(self) -> Event | None:
+    def check_idle(self) -> list[Event]:
+        """Check for idle/stream-end based on time elapsed since last data.
+        Returns a list of events (may be empty)."""
         now = time.monotonic()
-        elapsed = now - self._last_event_time
-        if elapsed >= self._idle_timeout and self._is_streaming:
+        elapsed_since_data = now - self._last_data_time
+        elapsed_since_event = now - self._last_event_time
+        events = []
+
+        # If streaming and no data for a while, end the stream
+        if self._is_streaming and elapsed_since_data >= 1.0:
             self._is_streaming = False
-            return Event(EventType.STREAM_END)
-        if elapsed >= self._idle_timeout:
+            events.append(Event(EventType.STREAM_END, source=EventSource.INTERNAL))
             self._last_event_time = now
-            return Event(EventType.IDLE)
-        return None
+
+        # If thinking and no data for a while, end thinking (stall detection)
+        elif self._is_thinking and elapsed_since_data >= 2.0:
+            pass  # Keep thinking — normal for Claude to pause
+
+        # General idle detection
+        elif elapsed_since_event >= self._idle_timeout and not self._is_streaming:
+            self._last_event_time = now
+            events.append(Event(EventType.IDLE, source=EventSource.INTERNAL))
+
+        return events
 
     def _parse_input(self, data: bytes, now: float) -> list[Event]:
         events = []
@@ -88,6 +122,16 @@ class EventParser:
             self._is_streaming = False
             self._is_thinking = False
             self._in_tool_block = False
+            self._awaiting_permission = False
+        elif self._awaiting_permission and data.strip():
+            # User responded to a permission prompt
+            self._awaiting_permission = False
+            response = data.strip()[:20]
+            accepted = response in (b"y", b"Y", b"yes", b"Yes", b"\r", b"\n")
+            events.append(Event(
+                EventType.PERMISSION_RESPONSE,
+                data={"accepted": accepted, "raw": response.decode(errors="replace")},
+            ))
         elif data.strip():
             events.append(Event(EventType.USER_INPUT, data={"raw": data[:50]}))
         return events
@@ -123,6 +167,20 @@ class EventParser:
             self._is_thinking = False
             events.append(Event(EventType.THINKING_END))
 
+        # Retry detection (before tool/error so it takes priority)
+        if RETRY_PATTERN.search(stripped):
+            self._is_streaming = False
+            if self._in_tool_block:
+                self._in_tool_block = False
+                events.append(Event(EventType.TOOL_END, data={"tool": self._current_tool}))
+            events.append(Event(EventType.RETRY, data={"text": stripped[:80]}))
+            return events
+
+        # Concurrent task detection
+        if CONCURRENT_TASK_PATTERN.search(stripped) and BOX_CHARS & set(stripped):
+            events.append(Event(EventType.CONCURRENT_TASK, data={"text": stripped[:80]}))
+            return events
+
         # Tool block detection
         tool = self._detect_tool(stripped)
         if tool:
@@ -154,7 +212,15 @@ class EventParser:
 
         # Permission prompt
         if PERMISSION_PATTERN.search(stripped):
+            self._awaiting_permission = True
             events.append(Event(EventType.PERMISSION_PROMPT))
+            return events
+
+        # Permission response in output (system-side confirmation)
+        if PERMISSION_RESPONSE_PATTERN.search(stripped):
+            if self._awaiting_permission:
+                self._awaiting_permission = False
+            events.append(Event(EventType.PERMISSION_RESPONSE, data={"accepted": True}))
             return events
 
         # Session resume

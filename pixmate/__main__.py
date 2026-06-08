@@ -6,7 +6,7 @@ import signal
 
 from .cli import parse_args
 from .config import load_config, PixMateConfig
-from .events import Event, EventType, Direction
+from .events import Event, EventType, EventSource, Direction
 from .event_parser import EventParser
 from .event_log import EventLog
 from .state_machine import StateMachine
@@ -16,6 +16,7 @@ from .animation.renderer import Renderer
 from .replay import ReplayPlayer
 from .demo import DemoRunner
 from .pty_proxy import PtyProxy
+from .claude_log_reader import ClaudeLogWatcher
 
 
 STATE_LABELS = {
@@ -76,7 +77,8 @@ async def run_proxy(config: PixMateConfig, args) -> int:
     if display_mode == "auto":
         display_mode = "tmux-split" if profile.in_tmux else "inline"
 
-    display = choose_display(display_mode, profile)
+    # Pass configured width to the display constructor
+    display = choose_display(display_mode, profile, width=config.companion_width)
     companion_width = display.companion_width
 
     display.setup(profile)
@@ -92,50 +94,87 @@ async def run_proxy(config: PixMateConfig, args) -> int:
     if log_path:
         event_log = EventLog(log_path)
 
-    # Animation loop state
-    animation_task: asyncio.Task | None = None
+    # Claude Code log watcher (real structured events)
+    log_watcher = ClaudeLogWatcher()
+    await log_watcher.start()
+
     running = True
 
-    async def animation_loop():
+    def _process_event(event: Event) -> None:
+        old_state = sm.current_name
+        new_state = sm.process_event(event)
+        if new_state:
+            label = STATE_LABELS.get(new_state.name, "")
+            if event.source == EventSource.CLAUDE_LOG:
+                tool = event.data.get("tool", "")
+                if tool:
+                    label = f"{label} ({tool})"
+            display.draw_label(label)
+            if event_log:
+                event_log.record(event, old_state, new_state.name)
+        elif event_log:
+            event_log.record(event, old_state, old_state)
+
+    def on_data(data: bytes, direction: Direction) -> None:
+        # Log raw PTY data for full-fidelity debug replay
+        if event_log and args.verbose:
+            event_log.record_raw(data, direction.value)
+
+        events = parser.feed(data, direction)
+        for event in events:
+            _process_event(event)
+
+    async def animation_and_idle_loop():
+        """Combined animation tick + idle/stream-end detection."""
         while running:
             state = sm.current
+
+            # Draw current animation frame
             display.draw_frame(state.animation_key)
 
+            # Check state timeout (celebrating->idle, idle->sleeping, etc.)
             timeout_state = sm.check_timeout()
             if timeout_state:
                 label = STATE_LABELS.get(timeout_state.name, "")
                 display.draw_label(label)
+                if event_log:
+                    event_log.record(
+                        Event(EventType.IDLE, source=EventSource.INTERNAL),
+                        state.name, timeout_state.name,
+                    )
 
-            fps = min(state.frame_rate, args.fps)
+            # Check parser idle/stream-end (stream silence, general idle)
+            idle_events = parser.check_idle()
+            for event in idle_events:
+                _process_event(event)
+
+            fps = min(state.frame_rate, config.max_fps)
             await asyncio.sleep(1.0 / max(fps, 0.5))
 
-    def on_data(data: bytes, direction: Direction) -> None:
-        events = parser.feed(data, direction)
-        for event in events:
-            old_state = sm.current_name
-            new_state = sm.process_event(event)
-            if new_state:
-                label = STATE_LABELS.get(new_state.name, "")
-                display.draw_label(label)
-                if event_log:
-                    event_log.record(event, old_state, new_state.name)
-            elif event_log:
-                event_log.record(event, old_state, old_state)
+    async def claude_log_poll_loop():
+        """Poll Claude Code's real log file for structured events."""
+        while running:
+            events = await log_watcher.poll()
+            for event in events:
+                _process_event(event)
+            await asyncio.sleep(0.5)
 
     proxy = PtyProxy(companion_width=companion_width)
 
-    animation_task = asyncio.create_task(animation_loop())
+    animation_task = asyncio.create_task(animation_and_idle_loop())
+    log_poll_task = asyncio.create_task(claude_log_poll_loop())
 
     try:
         exit_code = await proxy.run(args.command, on_data)
     finally:
         running = False
-        if animation_task:
-            animation_task.cancel()
-            try:
-                await animation_task
-            except asyncio.CancelledError:
-                pass
+        log_watcher.stop()
+        animation_task.cancel()
+        log_poll_task.cancel()
+        try:
+            await asyncio.gather(animation_task, log_poll_task, return_exceptions=True)
+        except Exception:
+            pass
         display.teardown()
         if event_log:
             event_log.close()

@@ -11,6 +11,12 @@ class Direction(Enum):
     OUTPUT = "output"
 
 
+class EventSource(Enum):
+    PTY = "pty"
+    CLAUDE_LOG = "claude_log"
+    INTERNAL = "internal"
+
+
 class EventType(Enum):
     USER_INPUT = "user_input"
     THINKING_START = "thinking_start"
@@ -22,6 +28,7 @@ class EventType(Enum):
     ERROR = "error"
     SUCCESS = "success"
     CANCEL = "cancel"
+    RETRY = "retry"
     PERMISSION_PROMPT = "permission_prompt"
     PERMISSION_RESPONSE = "permission_response"
     IDLE = "idle"
@@ -34,6 +41,7 @@ class Event:
     type: EventType
     timestamp: float = field(default_factory=time.monotonic)
     data: dict[str, Any] = field(default_factory=dict)
+    source: EventSource = EventSource.PTY
 
     def __repr__(self) -> str:
-        return f"Event({self.type.value}, data={self.data})"
+        return f"Event({self.type.value}, src={self.source.value}, data={self.data})"
